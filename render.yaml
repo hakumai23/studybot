@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: studybot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: DATA_DIR
+        value: /var/data
+    disks:
+      - name: studybot-data
+        mountPath: /var/data
+        sizeGB: 1
