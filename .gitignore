@@ -9,5 +9,6 @@ __pycache__/
 .env
 .env.*
 config.json
+study_time.db
 .vscode/
 .DS_Store
