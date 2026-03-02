@@ -1,0 +1,15 @@
+<service>
+  <id>studybot</id>
+  <name>StudyBot Discord Bot</name>
+  <description>Discord勉強管理Bot</description>
+  <executable>C:\Users\coro5\Documents\git\studybot\.venv\Scripts\python.exe</executable>
+  <arguments>bot.py</arguments>
+  <workingdirectory>C:\Users\coro5\Documents\git\studybot</workingdirectory>
+  <log mode="roll">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>3</keepFiles>
+  </log>
+  <onfailure action="restart" delay="10 sec"/>
+  <onfailure action="restart" delay="30 sec"/>
+  <onfailure action="restart" delay="1 min"/>
+</service>

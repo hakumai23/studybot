@@ -73,19 +73,23 @@ def get_now_utc() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
 
 
-def split_seconds_by_local_date(start_utc: datetime.datetime, end_utc: datetime.datetime, timezone_name: str) -> dict[str, int]:
+def split_seconds_by_local_date(start_utc: datetime.datetime, end_utc: datetime.datetime, timezone_name: str, reset_time: str = "00:00") -> dict[str, int]:
     if end_utc <= start_utc:
         return {}
     timezone = get_timezone(timezone_name)
     start_local = start_utc.astimezone(timezone)
     end_local = end_utc.astimezone(timezone)
+    reset_hour, reset_minute = [int(item) for item in normalize_time(reset_time).split(":")]
+    reset_delta = datetime.timedelta(hours=reset_hour, minutes=reset_minute)
     current = start_local
     segments: dict[str, int] = {}
     while current < end_local:
-        next_midnight = (current + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        segment_end = min(next_midnight, end_local)
+        reset_boundary = current.replace(hour=reset_hour, minute=reset_minute, second=0, microsecond=0)
+        if reset_boundary <= current:
+            reset_boundary += datetime.timedelta(days=1)
+        segment_end = min(reset_boundary, end_local)
         seconds = int((segment_end - current).total_seconds())
-        key = current.strftime("%Y-%m-%d")
+        key = (current - reset_delta).strftime("%Y-%m-%d")
         segments[key] = segments.get(key, 0) + max(seconds, 0)
         current = segment_end
     return segments
@@ -122,7 +126,7 @@ def start_study_session(guild_id: int, user_id: int, started_at: datetime.dateti
         connection.commit()
 
 
-def end_study_session(guild_id: int, user_id: int, ended_at: datetime.datetime, timezone_name: str) -> None:
+def end_study_session(guild_id: int, user_id: int, ended_at: datetime.datetime, timezone_name: str, reset_time: str = "00:00") -> None:
     with get_db_connection() as connection:
         row = connection.execute(
             "SELECT started_at FROM study_sessions WHERE guild_id = ? AND user_id = ?",
@@ -136,13 +140,16 @@ def end_study_session(guild_id: int, user_id: int, ended_at: datetime.datetime, 
         )
         connection.commit()
     started_at = datetime.datetime.fromtimestamp(int(row["started_at"]), tz=datetime.timezone.utc)
-    seconds_by_date = split_seconds_by_local_date(started_at, ended_at, timezone_name)
+    seconds_by_date = split_seconds_by_local_date(started_at, ended_at, timezone_name, reset_time)
     add_study_seconds(guild_id, user_id, seconds_by_date)
 
 
-def get_today_key(timezone_name: str) -> str:
+def get_today_key(timezone_name: str, reset_time: str = "00:00") -> str:
     timezone = get_timezone(timezone_name)
-    return datetime.datetime.now(timezone).strftime("%Y-%m-%d")
+    now_local = datetime.datetime.now(timezone)
+    reset_hour, reset_minute = [int(item) for item in normalize_time(reset_time).split(":")]
+    reset_delta = datetime.timedelta(hours=reset_hour, minutes=reset_minute)
+    return (now_local - reset_delta).strftime("%Y-%m-%d")
 
 
 def get_daily_seconds(guild_id: int, user_id: int, study_date: str) -> int:
@@ -233,16 +240,26 @@ def save_config(config: dict) -> None:
 def get_guild_config(guild_id: int) -> dict:
     config = load_config()
     entry = config.get(str(guild_id), {})
-    entry.setdefault("notify_time", "20:30")
+    if "anythingok_voice_channel_id" not in entry and "general_voice_channel_id" in entry:
+        entry["anythingok_voice_channel_id"] = entry.get("general_voice_channel_id")
+        entry.pop("general_voice_channel_id", None)
+    entry.pop("target_user_ids", None)
+    entry.setdefault("notify_time", "21:00")
     entry.setdefault("timezone", "Asia/Tokyo")
-    entry.setdefault("notify_message", "20:30の通知です")
+    entry.setdefault("notify_message", "勉強の時間です")
     entry.setdefault("general_channel_id", 1477655666528096440)
     entry.setdefault("game_channel_id", 1370726579021283334)
+    entry.setdefault("anythingok_voice_channel_id", 1370726579021283333)
     entry.setdefault("study_channel_id", 1473956243486933145)
-    entry.setdefault("target_user_ids", [])
+    entry.setdefault("notify_role_id", None)
+    entry.setdefault("excluded_role_ids", [])
+    entry.setdefault("maintenance_enabled", False)
+    entry.setdefault("error_channel_id", 1370726579021283331)
+    entry.setdefault("reset_time", "00:00")
     entry.setdefault("weekly_enabled", True)
     entry.setdefault("weekly_weekday", 6)
     entry.setdefault("weekly_time", "21:00")
+    entry.setdefault("weekly_period_days", 7)
     entry.setdefault("weekly_last_sent_week", "")
     return entry
 
@@ -297,6 +314,25 @@ def get_week_date_keys(now_local: datetime.datetime) -> list[str]:
     return [(start_date + datetime.timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(7)]
 
 
+def get_period_date_keys(now_local: datetime.datetime, reset_time: str, period_days: int) -> list[str]:
+    normalized_reset_time = normalize_time(reset_time)
+    reset_hour, reset_minute = [int(item) for item in normalized_reset_time.split(":")]
+    reset_delta = datetime.timedelta(hours=reset_hour, minutes=reset_minute)
+    business_date = (now_local - reset_delta).date()
+    start_date = business_date - datetime.timedelta(days=max(period_days - 1, 0))
+    return [(start_date + datetime.timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(period_days)]
+
+
+def get_period_range_text(now_local: datetime.datetime, reset_time: str, period_days: int) -> str:
+    normalized_reset_time = normalize_time(reset_time)
+    reset_hour, reset_minute = [int(item) for item in normalized_reset_time.split(":")]
+    reset_delta = datetime.timedelta(hours=reset_hour, minutes=reset_minute)
+    business_date = (now_local - reset_delta).date()
+    start_date = business_date - datetime.timedelta(days=max(period_days - 1, 0))
+    start_local = datetime.datetime.combine(start_date, datetime.time(hour=reset_hour, minute=reset_minute), tzinfo=now_local.tzinfo)
+    return f"対象期間: {start_local.strftime('%Y-%m-%d %H:%M')} 〜 {now_local.strftime('%Y-%m-%d %H:%M')} ({period_days}日)"
+
+
 def should_send_weekly_now(config: dict) -> tuple[bool, str]:
     if not config.get("weekly_enabled", True):
         return False, ""
@@ -314,10 +350,10 @@ def should_send_weekly_now(config: dict) -> tuple[bool, str]:
     return True, week_key
 
 
-def get_weekly_totals(guild_id: int, timezone_name: str, now_utc: datetime.datetime) -> dict[int, int]:
+def get_weekly_totals(guild_id: int, timezone_name: str, now_utc: datetime.datetime, reset_time: str, period_days: int) -> dict[int, int]:
     timezone = get_timezone(timezone_name)
     now_local = now_utc.astimezone(timezone)
-    date_keys = get_week_date_keys(now_local)
+    date_keys = get_period_date_keys(now_local, reset_time, period_days)
     totals: dict[int, int] = {}
     with get_db_connection() as connection:
         placeholders = ",".join(["?"] * len(date_keys))
@@ -330,7 +366,7 @@ def get_weekly_totals(guild_id: int, timezone_name: str, now_utc: datetime.datet
     week_start_key = date_keys[0]
     week_end_key = date_keys[-1]
     for user_id, started_at in get_active_sessions(guild_id):
-        extra_by_date = split_seconds_by_local_date(started_at, now_utc, timezone_name)
+        extra_by_date = split_seconds_by_local_date(started_at, now_utc, timezone_name, reset_time)
         extra = 0
         for date_key, seconds in extra_by_date.items():
             if week_start_key <= date_key <= week_end_key:
@@ -345,14 +381,17 @@ async def send_weekly_summary(guild: discord.Guild, config: dict) -> None:
     if not channel_id:
         return
     timezone_name = config.get("timezone", "Asia/Tokyo")
-    totals = get_weekly_totals(guild.id, timezone_name, get_now_utc())
+    reset_time = config.get("reset_time", "00:00")
+    period_days = int(config.get("weekly_period_days", 7))
+    now_utc = get_now_utc()
+    now_local = now_utc.astimezone(get_timezone(timezone_name))
+    totals = get_weekly_totals(guild.id, timezone_name, now_utc, reset_time, period_days)
     if not totals:
         return
     ranking = sorted(totals.items(), key=lambda item: item[1], reverse=True)[:10]
-    lines = ["今週の勉強時間ランキング"]
+    lines = ["週次勉強時間ランキング", get_period_range_text(now_local, reset_time, period_days)]
     for index, (user_id, seconds) in enumerate(ranking, start=1):
-        member = guild.get_member(user_id)
-        name = member.display_name if member else str(user_id)
+        name = await resolve_user_display_name(guild, user_id)
         lines.append(f"{index}. {name} {format_seconds(seconds)}")
     channel = guild.get_channel(channel_id) or await guild.fetch_channel(channel_id)
     await channel.send("\n".join(lines))
@@ -368,17 +407,55 @@ tree = app_commands.CommandTree(client)
 last_run_by_guild: dict[int, str] = {}
 
 
-async def move_game_to_study(guild: discord.Guild, config: dict) -> int:
+async def resolve_user_display_name(guild: discord.Guild, user_id: int) -> str:
+    member = guild.get_member(user_id)
+    if member is not None:
+        return member.display_name
+    try:
+        member = await guild.fetch_member(user_id)
+        return member.display_name
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
+    user = client.get_user(user_id)
+    if user is not None:
+        return user.name
+    try:
+        user = await client.fetch_user(user_id)
+        return user.name
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return str(user_id)
+
+
+def is_excluded_member(member: discord.Member, excluded_role_ids: set[int]) -> bool:
+    if not excluded_role_ids:
+        return False
+    member_role_ids = {role.id for role in member.roles}
+    return bool(member_role_ids & excluded_role_ids)
+
+
+async def collect_move_members(guild: discord.Guild, config: dict) -> tuple[discord.VoiceChannel, list[discord.Member]]:
     game_channel_id = config.get("game_channel_id")
+    anythingok_voice_channel_id = config.get("anythingok_voice_channel_id")
     study_channel_id = config.get("study_channel_id")
     if not game_channel_id or not study_channel_id:
-        return 0
+        raise RuntimeError("移動元または移動先チャンネルが未設定です")
     game_channel = guild.get_channel(game_channel_id) or await guild.fetch_channel(game_channel_id)
+    anythingok_voice_channel = None
+    if anythingok_voice_channel_id:
+        anythingok_voice_channel = guild.get_channel(anythingok_voice_channel_id) or await guild.fetch_channel(anythingok_voice_channel_id)
     study_channel = guild.get_channel(study_channel_id) or await guild.fetch_channel(study_channel_id)
-    members = list(game_channel.members)
-    target_user_ids = set(config.get("target_user_ids", []))
-    if target_user_ids:
-        members = [member for member in members if member.id in target_user_ids]
+    members: list[discord.Member] = []
+    members.extend(list(game_channel.members))
+    if anythingok_voice_channel is not None:
+        members.extend(list(anythingok_voice_channel.members))
+    unique_members: dict[int, discord.Member] = {member.id: member for member in members}
+    excluded_role_ids = set(config.get("excluded_role_ids", []))
+    filtered_members = [member for member in unique_members.values() if not is_excluded_member(member, excluded_role_ids)]
+    return study_channel, filtered_members
+
+
+async def move_game_to_study(guild: discord.Guild, config: dict) -> int:
+    study_channel, members = await collect_move_members(guild, config)
     for member in members:
         await member.move_to(study_channel)
     return len(members)
@@ -402,44 +479,67 @@ async def send_message(guild: discord.Guild, config: dict) -> None:
     if not channel_id:
         return
     channel = guild.get_channel(channel_id) or await guild.fetch_channel(channel_id)
-    await channel.send(config.get("notify_message", "20:30の通知です"))
+    message = config.get("notify_message", "20:30の通知です")
+    notify_role_id = config.get("notify_role_id")
+    if notify_role_id:
+        message = f"<@&{notify_role_id}> {message}"
+    await channel.send(message, allowed_mentions=discord.AllowedMentions(roles=True))
+
+
+async def notify_error(guild: discord.Guild, config: dict, error_text: str) -> None:
+    error_channel_id = config.get("error_channel_id")
+    if not error_channel_id:
+        return
+    try:
+        channel = guild.get_channel(error_channel_id) or await guild.fetch_channel(error_channel_id)
+        await channel.send(f"⚠️ {error_text}")
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return
 
 
 @tasks.loop(minutes=1)
 async def notify_loop() -> None:
     for guild in client.guilds:
         config = get_guild_config(guild.id)
-        should_run, last_key = should_notify_now(config, last_run_by_guild.get(guild.id))
-        last_run_by_guild[guild.id] = last_key
-        if not should_run:
+        try:
+            if config.get("maintenance_enabled", False):
+                continue
+            should_run, last_key = should_notify_now(config, last_run_by_guild.get(guild.id))
+            last_run_by_guild[guild.id] = last_key
+            if not should_run:
+                send_weekly, week_key = should_send_weekly_now(config)
+                if send_weekly:
+                    await send_weekly_summary(guild, config)
+                    update_guild_config(guild.id, {"weekly_last_sent_week": week_key})
+                continue
+            await move_game_to_study(guild, config)
+            await send_message(guild, config)
             send_weekly, week_key = should_send_weekly_now(config)
             if send_weekly:
                 await send_weekly_summary(guild, config)
                 update_guild_config(guild.id, {"weekly_last_sent_week": week_key})
-            continue
-        await move_game_to_study(guild, config)
-        await send_message(guild, config)
-        send_weekly, week_key = should_send_weekly_now(config)
-        if send_weekly:
-            await send_weekly_summary(guild, config)
-            update_guild_config(guild.id, {"weekly_last_sent_week": week_key})
+        except Exception as error:
+            await notify_error(guild, config, f"定時処理でエラーが発生しました: {error}")
 
 
 @client.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState) -> None:
     guild = member.guild
     config = get_guild_config(guild.id)
-    study_channel_id = config.get("study_channel_id")
-    if not study_channel_id:
-        return
-    before_id = before.channel.id if before.channel else None
-    after_id = after.channel.id if after.channel else None
-    entered_study = before_id != study_channel_id and after_id == study_channel_id
-    left_study = before_id == study_channel_id and after_id != study_channel_id
-    if entered_study:
-        start_study_session(guild.id, member.id, get_now_utc())
-    if left_study:
-        end_study_session(guild.id, member.id, get_now_utc(), config.get("timezone", "Asia/Tokyo"))
+    try:
+        study_channel_id = config.get("study_channel_id")
+        if not study_channel_id:
+            return
+        before_id = before.channel.id if before.channel else None
+        after_id = after.channel.id if after.channel else None
+        entered_study = before_id != study_channel_id and after_id == study_channel_id
+        left_study = before_id == study_channel_id and after_id != study_channel_id
+        if entered_study:
+            start_study_session(guild.id, member.id, get_now_utc())
+        if left_study:
+            end_study_session(guild.id, member.id, get_now_utc(), config.get("timezone", "Asia/Tokyo"), config.get("reset_time", "00:00"))
+    except Exception as error:
+        await notify_error(guild, config, f"音声状態更新処理でエラーが発生しました: {error}")
 
 
 @client.event
@@ -474,13 +574,19 @@ async def config_show(interaction: discord.Interaction) -> None:
                 f"NOTIFY_TIME: {config['notify_time']}",
                 f"TIMEZONE: {config['timezone']}",
                 f"NOTIFY_MESSAGE: {config['notify_message']}",
+                f"NOTIFY_ROLE_ID: {config['notify_role_id']}",
                 f"GENERAL: {config['general_channel_id']}",
                 f"GAME: {config['game_channel_id']}",
+                f"ANYTHINGOK_VOICE: {config['anythingok_voice_channel_id']}",
                 f"STUDY: {config['study_channel_id']}",
-                f"TARGET_USER_IDS: {','.join(str(item) for item in config['target_user_ids'])}",
+                f"EXCLUDED_ROLE_IDS: {','.join(str(item) for item in config['excluded_role_ids'])}",
+                f"MAINTENANCE_ENABLED: {config['maintenance_enabled']}",
+                f"ERROR_CHANNEL_ID: {config['error_channel_id']}",
+                f"RESET_TIME: {config['reset_time']}",
                 f"WEEKLY_ENABLED: {config['weekly_enabled']}",
                 f"WEEKLY_WEEKDAY: {config['weekly_weekday']}",
-                f"WEEKLY_TIME: {config['weekly_time']}"
+                f"WEEKLY_TIME: {config['weekly_time']}",
+                f"WEEKLY_PERIOD_DAYS: {config['weekly_period_days']}"
             ]
         ),
         ephemeral=True
@@ -509,6 +615,17 @@ async def config_set_game(interaction: discord.Interaction, channel: discord.Voi
     await interaction.response.send_message("GAMEを更新しました。", ephemeral=True)
 
 
+@config_group.command(name="set_anythingok_voice")
+@app_commands.checks.has_permissions(administrator=True)
+async def config_set_anythingok_voice(interaction: discord.Interaction, channel: discord.VoiceChannel) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    update_guild_config(guild_id, {"anythingok_voice_channel_id": channel.id})
+    await interaction.response.send_message("ANYTHINGOK_VOICEを更新しました。", ephemeral=True)
+
+
 @config_group.command(name="set_study")
 @app_commands.checks.has_permissions(administrator=True)
 async def config_set_study(interaction: discord.Interaction, channel: discord.VoiceChannel) -> None:
@@ -518,18 +635,6 @@ async def config_set_study(interaction: discord.Interaction, channel: discord.Vo
         return
     update_guild_config(guild_id, {"study_channel_id": channel.id})
     await interaction.response.send_message("STUDYを更新しました。", ephemeral=True)
-
-
-@config_group.command(name="set_users")
-@app_commands.checks.has_permissions(administrator=True)
-async def config_set_users(interaction: discord.Interaction, users: str) -> None:
-    guild_id = require_guild(interaction)
-    if not guild_id:
-        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
-        return
-    ids = parse_ids(users)
-    update_guild_config(guild_id, {"target_user_ids": ids})
-    await interaction.response.send_message("対象ユーザーを更新しました。", ephemeral=True)
 
 
 @config_group.command(name="set_time")
@@ -575,6 +680,127 @@ async def config_set_message(interaction: discord.Interaction, message: str) -> 
     await interaction.response.send_message("通知文を更新しました。", ephemeral=True)
 
 
+@config_group.command(name="set_reset_time")
+@app_commands.checks.has_permissions(administrator=True)
+async def config_set_reset_time(interaction: discord.Interaction, time: str) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    try:
+        normalized_time = normalize_time(time)
+    except ValueError:
+        await interaction.response.send_message("時刻はHH:MM形式で指定してください。", ephemeral=True)
+        return
+    update_guild_config(guild_id, {"reset_time": normalized_time})
+    await interaction.response.send_message("日次リセット時刻を更新しました。", ephemeral=True)
+
+
+@config_group.command(name="set_notify_role")
+@app_commands.checks.has_permissions(administrator=True)
+async def config_set_notify_role(interaction: discord.Interaction, role: discord.Role) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    update_guild_config(guild_id, {"notify_role_id": role.id})
+    await interaction.response.send_message("通知メンションロールを更新しました。", ephemeral=True)
+
+
+@config_group.command(name="clear_notify_role")
+@app_commands.checks.has_permissions(administrator=True)
+async def config_clear_notify_role(interaction: discord.Interaction) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    update_guild_config(guild_id, {"notify_role_id": None})
+    await interaction.response.send_message("通知メンションロールを解除しました。", ephemeral=True)
+
+
+@config_group.command(name="add_exclude_role")
+@app_commands.checks.has_permissions(administrator=True)
+async def config_add_exclude_role(interaction: discord.Interaction, role: discord.Role) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    config = get_guild_config(guild_id)
+    excluded_role_ids = list(config.get("excluded_role_ids", []))
+    if role.id not in excluded_role_ids:
+        excluded_role_ids.append(role.id)
+    update_guild_config(guild_id, {"excluded_role_ids": excluded_role_ids})
+    await interaction.response.send_message("移動除外ロールを追加しました。", ephemeral=True)
+
+
+@config_group.command(name="remove_exclude_role")
+@app_commands.checks.has_permissions(administrator=True)
+async def config_remove_exclude_role(interaction: discord.Interaction, role: discord.Role) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    config = get_guild_config(guild_id)
+    excluded_role_ids = [item for item in config.get("excluded_role_ids", []) if int(item) != role.id]
+    update_guild_config(guild_id, {"excluded_role_ids": excluded_role_ids})
+    await interaction.response.send_message("移動除外ロールを削除しました。", ephemeral=True)
+
+
+@config_group.command(name="clear_exclude_roles")
+@app_commands.checks.has_permissions(administrator=True)
+async def config_clear_exclude_roles(interaction: discord.Interaction) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    update_guild_config(guild_id, {"excluded_role_ids": []})
+    await interaction.response.send_message("移動除外ロールをクリアしました。", ephemeral=True)
+
+
+@config_group.command(name="set_maintenance")
+@app_commands.checks.has_permissions(administrator=True)
+async def config_set_maintenance(interaction: discord.Interaction, enabled: bool) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    update_guild_config(guild_id, {"maintenance_enabled": enabled})
+    await interaction.response.send_message("メンテ停止スイッチを更新しました。", ephemeral=True)
+
+
+@config_group.command(name="set_error_channel")
+@app_commands.checks.has_permissions(administrator=True)
+async def config_set_error_channel(interaction: discord.Interaction, channel: discord.TextChannel) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    update_guild_config(guild_id, {"error_channel_id": channel.id})
+    await interaction.response.send_message("エラー通知先チャンネルを更新しました。", ephemeral=True)
+
+
+@config_group.command(name="clear_error_channel")
+@app_commands.checks.has_permissions(administrator=True)
+async def config_clear_error_channel(interaction: discord.Interaction) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    update_guild_config(guild_id, {"error_channel_id": None})
+    await interaction.response.send_message("エラー通知先チャンネルを解除しました。", ephemeral=True)
+
+
+@config_group.command(name="set_weekly_period")
+@app_commands.checks.has_permissions(administrator=True)
+async def config_set_weekly_period(interaction: discord.Interaction, days: app_commands.Range[int, 1, 31]) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    update_guild_config(guild_id, {"weekly_period_days": int(days)})
+    await interaction.response.send_message("週次ランキング対象日数を更新しました。", ephemeral=True)
+
+
 @config_group.command(name="set_weekly")
 @app_commands.checks.has_permissions(administrator=True)
 async def config_set_weekly(interaction: discord.Interaction, weekday: app_commands.Range[int, 0, 6], time: str) -> None:
@@ -618,6 +844,75 @@ async def config_move_study_to_game(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(f"{moved}人をSTUDYからGAMEへ移動しました。", ephemeral=True)
 
 
+@config_group.command(name="move_game_to_study")
+@app_commands.checks.has_permissions(administrator=True)
+async def config_move_game_to_study(interaction: discord.Interaction) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("サーバー情報を取得できませんでした。", ephemeral=True)
+        return
+    config = get_guild_config(guild_id)
+    try:
+        moved = await move_game_to_study(guild, config)
+    except Exception as error:
+        await interaction.response.send_message(f"実行に失敗しました: {error}", ephemeral=True)
+        return
+    await interaction.response.send_message(f"{moved}人をGAME/ANYTHINGOK_VOICEからSTUDYへ移動しました。", ephemeral=True)
+
+
+@config_group.command(name="dry_run")
+@app_commands.checks.has_permissions(administrator=True)
+async def config_dry_run(interaction: discord.Interaction) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("サーバー情報を取得できませんでした。", ephemeral=True)
+        return
+    config = get_guild_config(guild_id)
+    try:
+        study_channel, members = await collect_move_members(guild, config)
+    except Exception as error:
+        await interaction.response.send_message(f"実行に失敗しました: {error}", ephemeral=True)
+        return
+    member_names = [member.display_name for member in members[:20]]
+    lines = [
+        f"移動先: {study_channel.name}",
+        f"移動対象人数: {len(members)}人",
+        f"除外ロール数: {len(config.get('excluded_role_ids', []))}"
+    ]
+    if member_names:
+        lines.append("対象メンバー(先頭20人): " + ", ".join(member_names))
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@config_group.command(name="run_now")
+@app_commands.checks.has_permissions(administrator=True)
+async def config_run_now(interaction: discord.Interaction) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("サーバー情報を取得できませんでした。", ephemeral=True)
+        return
+    config = get_guild_config(guild_id)
+    try:
+        moved = await move_game_to_study(guild, config)
+        await send_message(guild, config)
+    except Exception as error:
+        await interaction.response.send_message(f"実行に失敗しました: {error}", ephemeral=True)
+        return
+    await interaction.response.send_message(f"手動実行しました。移動: {moved}人、通知送信: 1件", ephemeral=True)
+
+
 @study_group.command(name="me")
 async def study_me(interaction: discord.Interaction) -> None:
     guild_id = require_guild(interaction)
@@ -627,11 +922,12 @@ async def study_me(interaction: discord.Interaction) -> None:
     user_id = interaction.user.id
     config = get_guild_config(guild_id)
     timezone_name = config.get("timezone", "Asia/Tokyo")
-    today_key = get_today_key(timezone_name)
+    reset_time = config.get("reset_time", "00:00")
+    today_key = get_today_key(timezone_name, reset_time)
     total_seconds = get_daily_seconds(guild_id, user_id, today_key)
     active_start = get_active_session_start(guild_id, user_id)
     if active_start is not None:
-        extra_by_date = split_seconds_by_local_date(active_start, get_now_utc(), timezone_name)
+        extra_by_date = split_seconds_by_local_date(active_start, get_now_utc(), timezone_name, reset_time)
         total_seconds += int(extra_by_date.get(today_key, 0))
     await interaction.response.send_message(
         f"今日の勉強時間: {format_seconds(total_seconds)}",
@@ -651,11 +947,12 @@ async def study_rank(interaction: discord.Interaction, limit: app_commands.Range
         return
     config = get_guild_config(guild_id)
     timezone_name = config.get("timezone", "Asia/Tokyo")
-    today_key = get_today_key(timezone_name)
+    reset_time = config.get("reset_time", "00:00")
+    today_key = get_today_key(timezone_name, reset_time)
     totals = get_rank_daily_seconds(guild_id, today_key)
     now_utc = get_now_utc()
     for user_id, started_at in get_active_sessions(guild_id):
-        extra_by_date = split_seconds_by_local_date(started_at, now_utc, timezone_name)
+        extra_by_date = split_seconds_by_local_date(started_at, now_utc, timezone_name, reset_time)
         extra_today = int(extra_by_date.get(today_key, 0))
         totals[user_id] = totals.get(user_id, 0) + extra_today
     ranking = sorted(totals.items(), key=lambda item: item[1], reverse=True)[:limit]
@@ -664,8 +961,7 @@ async def study_rank(interaction: discord.Interaction, limit: app_commands.Range
         return
     lines: list[str] = []
     for index, (user_id, seconds) in enumerate(ranking, start=1):
-        member = guild.get_member(user_id)
-        name = member.display_name if member else str(user_id)
+        name = await resolve_user_display_name(guild, user_id)
         lines.append(f"{index}. {name} {format_seconds(seconds)}")
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 

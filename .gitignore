@@ -12,3 +12,7 @@ config.json
 study_time.db
 .vscode/
 .DS_Store
+studybot-service.exe
+studybot-service.out.log
+studybot-service.err.log
+studybot-service.wrapper.log
