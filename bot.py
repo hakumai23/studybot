@@ -253,7 +253,9 @@ def get_guild_config(guild_id: int) -> dict:
     entry.setdefault("study_channel_id", 1473956243486933145)
     entry.setdefault("notify_role_id", None)
     entry.setdefault("excluded_role_ids", [])
+    entry.setdefault("aggregation_excluded_user_ids", [])
     entry.setdefault("maintenance_enabled", False)
+    entry.setdefault("maintenance_until_epoch", 0)
     entry.setdefault("error_channel_id", 1370726579021283331)
     entry.setdefault("reset_time", "00:00")
     entry.setdefault("weekly_enabled", True)
@@ -304,6 +306,25 @@ def should_notify_now(config: dict, last_run: str | None) -> tuple[bool, str]:
     return True, key
 
 
+def resolve_maintenance_enabled(guild_id: int, config: dict) -> bool:
+    if not config.get("maintenance_enabled", False):
+        return False
+    until_epoch = int(config.get("maintenance_until_epoch", 0) or 0)
+    if until_epoch <= 0:
+        return True
+    now_epoch = int(get_now_utc().timestamp())
+    if now_epoch < until_epoch:
+        return True
+    update_guild_config(guild_id, {"maintenance_enabled": False, "maintenance_until_epoch": 0})
+    config["maintenance_enabled"] = False
+    config["maintenance_until_epoch"] = 0
+    return False
+
+
+def get_excluded_user_id_set(config: dict) -> set[int]:
+    return {int(item) for item in config.get("aggregation_excluded_user_ids", [])}
+
+
 def get_week_key(now_local: datetime.datetime) -> str:
     iso_year, iso_week, _ = now_local.isocalendar()
     return f"{iso_year}-W{iso_week:02d}"
@@ -350,7 +371,7 @@ def should_send_weekly_now(config: dict) -> tuple[bool, str]:
     return True, week_key
 
 
-def get_weekly_totals(guild_id: int, timezone_name: str, now_utc: datetime.datetime, reset_time: str, period_days: int) -> dict[int, int]:
+def get_weekly_totals(guild_id: int, timezone_name: str, now_utc: datetime.datetime, reset_time: str, period_days: int, excluded_user_ids: set[int]) -> dict[int, int]:
     timezone = get_timezone(timezone_name)
     now_local = now_utc.astimezone(timezone)
     date_keys = get_period_date_keys(now_local, reset_time, period_days)
@@ -362,10 +383,15 @@ def get_weekly_totals(guild_id: int, timezone_name: str, now_utc: datetime.datet
             [guild_id, *date_keys]
         ).fetchall()
     for row in rows:
-        totals[int(row["user_id"])] = int(row["total"])
+        user_id = int(row["user_id"])
+        if user_id in excluded_user_ids:
+            continue
+        totals[user_id] = int(row["total"])
     week_start_key = date_keys[0]
     week_end_key = date_keys[-1]
     for user_id, started_at in get_active_sessions(guild_id):
+        if user_id in excluded_user_ids:
+            continue
         extra_by_date = split_seconds_by_local_date(started_at, now_utc, timezone_name, reset_time)
         extra = 0
         for date_key, seconds in extra_by_date.items():
@@ -385,7 +411,8 @@ async def send_weekly_summary(guild: discord.Guild, config: dict) -> None:
     period_days = int(config.get("weekly_period_days", 7))
     now_utc = get_now_utc()
     now_local = now_utc.astimezone(get_timezone(timezone_name))
-    totals = get_weekly_totals(guild.id, timezone_name, now_utc, reset_time, period_days)
+    excluded_user_ids = get_excluded_user_id_set(config)
+    totals = get_weekly_totals(guild.id, timezone_name, now_utc, reset_time, period_days, excluded_user_ids)
     if not totals:
         return
     ranking = sorted(totals.items(), key=lambda item: item[1], reverse=True)[:10]
@@ -502,7 +529,7 @@ async def notify_loop() -> None:
     for guild in client.guilds:
         config = get_guild_config(guild.id)
         try:
-            if config.get("maintenance_enabled", False):
+            if resolve_maintenance_enabled(guild.id, config):
                 continue
             should_run, last_key = should_notify_now(config, last_run_by_guild.get(guild.id))
             last_run_by_guild[guild.id] = last_key
@@ -580,7 +607,9 @@ async def config_show(interaction: discord.Interaction) -> None:
                 f"ANYTHINGOK_VOICE: {config['anythingok_voice_channel_id']}",
                 f"STUDY: {config['study_channel_id']}",
                 f"EXCLUDED_ROLE_IDS: {','.join(str(item) for item in config['excluded_role_ids'])}",
+                f"AGGREGATION_EXCLUDED_USER_IDS: {','.join(str(item) for item in config['aggregation_excluded_user_ids'])}",
                 f"MAINTENANCE_ENABLED: {config['maintenance_enabled']}",
+                f"MAINTENANCE_UNTIL_EPOCH: {config['maintenance_until_epoch']}",
                 f"ERROR_CHANNEL_ID: {config['error_channel_id']}",
                 f"RESET_TIME: {config['reset_time']}",
                 f"WEEKLY_ENABLED: {config['weekly_enabled']}",
@@ -764,8 +793,67 @@ async def config_set_maintenance(interaction: discord.Interaction, enabled: bool
     if not guild_id:
         await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
         return
-    update_guild_config(guild_id, {"maintenance_enabled": enabled})
+    update_guild_config(guild_id, {"maintenance_enabled": enabled, "maintenance_until_epoch": 0})
     await interaction.response.send_message("メンテ停止スイッチを更新しました。", ephemeral=True)
+
+
+@config_group.command(name="set_maintenance_for")
+@app_commands.checks.has_permissions(administrator=True)
+async def config_set_maintenance_for(interaction: discord.Interaction, minutes: app_commands.Range[int, 1, 10080]) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    config = get_guild_config(guild_id)
+    timezone_name = config.get("timezone", "Asia/Tokyo")
+    now_utc = get_now_utc()
+    until_utc = now_utc + datetime.timedelta(minutes=int(minutes))
+    until_epoch = int(until_utc.timestamp())
+    until_local = until_utc.astimezone(get_timezone(timezone_name)).strftime("%Y-%m-%d %H:%M")
+    update_guild_config(guild_id, {"maintenance_enabled": True, "maintenance_until_epoch": until_epoch})
+    await interaction.response.send_message(
+        f"メンテナンスモードを有効化しました。終了予定: {until_local} ({timezone_name})",
+        ephemeral=True
+    )
+
+
+@config_group.command(name="add_exclude_user")
+@app_commands.checks.has_permissions(administrator=True)
+async def config_add_exclude_user(interaction: discord.Interaction, user: discord.Member) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    config = get_guild_config(guild_id)
+    excluded_user_ids = [int(item) for item in config.get("aggregation_excluded_user_ids", [])]
+    if user.id not in excluded_user_ids:
+        excluded_user_ids.append(user.id)
+    update_guild_config(guild_id, {"aggregation_excluded_user_ids": excluded_user_ids})
+    await interaction.response.send_message("集計除外ユーザーを追加しました。", ephemeral=True)
+
+
+@config_group.command(name="remove_exclude_user")
+@app_commands.checks.has_permissions(administrator=True)
+async def config_remove_exclude_user(interaction: discord.Interaction, user: discord.Member) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    config = get_guild_config(guild_id)
+    excluded_user_ids = [int(item) for item in config.get("aggregation_excluded_user_ids", []) if int(item) != user.id]
+    update_guild_config(guild_id, {"aggregation_excluded_user_ids": excluded_user_ids})
+    await interaction.response.send_message("集計除外ユーザーを削除しました。", ephemeral=True)
+
+
+@config_group.command(name="clear_exclude_users")
+@app_commands.checks.has_permissions(administrator=True)
+async def config_clear_exclude_users(interaction: discord.Interaction) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    update_guild_config(guild_id, {"aggregation_excluded_user_ids": []})
+    await interaction.response.send_message("集計除外ユーザーをクリアしました。", ephemeral=True)
 
 
 @config_group.command(name="set_error_channel")
@@ -950,8 +1038,14 @@ async def study_rank(interaction: discord.Interaction, limit: app_commands.Range
     reset_time = config.get("reset_time", "00:00")
     today_key = get_today_key(timezone_name, reset_time)
     totals = get_rank_daily_seconds(guild_id, today_key)
+    excluded_user_ids = get_excluded_user_id_set(config)
+    for user_id in list(totals.keys()):
+        if user_id in excluded_user_ids:
+            totals.pop(user_id, None)
     now_utc = get_now_utc()
     for user_id, started_at in get_active_sessions(guild_id):
+        if user_id in excluded_user_ids:
+            continue
         extra_by_date = split_seconds_by_local_date(started_at, now_utc, timezone_name, reset_time)
         extra_today = int(extra_by_date.get(today_key, 0))
         totals[user_id] = totals.get(user_id, 0) + extra_today
