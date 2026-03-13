@@ -16,3 +16,4 @@ studybot-service.exe
 studybot-service.out.log
 studybot-service.err.log
 studybot-service.wrapper.log
+studybot-service.err.log.old
