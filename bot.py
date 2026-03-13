@@ -1,7 +1,11 @@
 import os
 import json
 import datetime
+import asyncio
 import sqlite3
+import io
+import re
+import threading
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from zoneinfo import ZoneInfoNotFoundError
@@ -9,9 +13,36 @@ from zoneinfo import ZoneInfoNotFoundError
 import discord
 from discord import app_commands
 from discord.ext import tasks
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib import font_manager
 
 
 ENV_PATH = Path(".env")
+
+
+def configure_matplotlib_font() -> None:
+    preferred_fonts = [
+        "Yu Gothic",
+        "YuGothic",
+        "Meiryo",
+        "Noto Sans CJK JP",
+        "Noto Sans JP",
+        "IPAexGothic",
+        "IPAGothic",
+        "MS Gothic"
+    ]
+    installed_fonts = {font.name for font in font_manager.fontManager.ttflist}
+    selected_font = None
+    for font_name in preferred_fonts:
+        if font_name in installed_fonts:
+            selected_font = font_name
+            break
+    if selected_font:
+        plt.rcParams["font.family"] = selected_font
+    plt.rcParams["axes.unicode_minus"] = False
 
 
 def load_env_file() -> None:
@@ -29,12 +60,14 @@ def load_env_file() -> None:
 
 
 load_env_file()
+configure_matplotlib_font()
 
 
 DATA_DIR = Path(os.getenv("DATA_DIR", ".")).expanduser()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_PATH = DATA_DIR / "config.json"
 STUDY_DB_PATH = DATA_DIR / "study_time.db"
+CONFIG_LOCK = threading.Lock()
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -208,6 +241,31 @@ def format_seconds(seconds: int) -> str:
     return f"{hours:02d}:{minutes:02d}:{sec:02d}"
 
 
+def create_ranking_chart_image(title: str, names: list[str], seconds_list: list[int]) -> io.BytesIO:
+    labels = [f"{index + 1}. {name}" for index, name in enumerate(names)]
+    values = [seconds / 3600 for seconds in seconds_list]
+    figure_width = max(8.0, 1.2 * len(labels) + 3.0)
+    fig, ax = plt.subplots(figsize=(figure_width, 6.0))
+    bars = ax.bar(labels, values, color="#2D7FF9")
+    ax.set_title(title)
+    ax.set_xlabel("Hours")
+    ax.set_ylabel("Users")
+    ax.tick_params(axis="x", labelrotation=25)
+    max_value = max(values) if values else 0
+    for bar, seconds in zip(bars, seconds_list):
+        height = float(bar.get_height())
+        text_y = height + max(max_value * 0.01, 0.02)
+        ax.text(bar.get_x() + bar.get_width() / 2, text_y, format_seconds(int(seconds)), ha="center", va="bottom")
+    if max_value > 0:
+        ax.set_ylim(0, max_value * 1.2)
+    fig.tight_layout()
+    image_stream = io.BytesIO()
+    fig.savefig(image_stream, format="png", dpi=150)
+    plt.close(fig)
+    image_stream.seek(0)
+    return image_stream
+
+
 def get_required_env(name: str) -> str:
     value = os.getenv(name)
     if not value:
@@ -267,12 +325,13 @@ def get_guild_config(guild_id: int) -> dict:
 
 
 def update_guild_config(guild_id: int, updates: dict) -> dict:
-    config = load_config()
-    entry = config.get(str(guild_id), {})
-    entry.update(updates)
-    config[str(guild_id)] = entry
-    save_config(config)
-    return entry
+    with CONFIG_LOCK:
+        config = load_config()
+        entry = config.get(str(guild_id), {})
+        entry.update(updates)
+        config[str(guild_id)] = entry
+        save_config(config)
+        return entry
 
 
 def get_notify_time(config: dict) -> datetime.time:
@@ -417,11 +476,19 @@ async def send_weekly_summary(guild: discord.Guild, config: dict) -> None:
         return
     ranking = sorted(totals.items(), key=lambda item: item[1], reverse=True)[:10]
     lines = ["週次勉強時間ランキング", get_period_range_text(now_local, reset_time, period_days)]
+    names: list[str] = []
+    seconds_values: list[int] = []
     for index, (user_id, seconds) in enumerate(ranking, start=1):
         name = await resolve_user_display_name(guild, user_id)
         lines.append(f"{index}. {name} {format_seconds(seconds)}")
-    channel = guild.get_channel(channel_id) or await guild.fetch_channel(channel_id)
-    await channel.send("\n".join(lines))
+        names.append(name)
+        seconds_values.append(seconds)
+    channel = await resolve_guild_channel(guild, int(channel_id))
+    if channel is None or not isinstance(channel, discord.abc.Messageable):
+        return
+    chart_stream = create_ranking_chart_image("Weekly Ranking", names, seconds_values)
+    chart_file = discord.File(fp=chart_stream, filename="weekly_summary.png")
+    await channel.send("\n".join(lines), file=chart_file)
 
 
 intents = discord.Intents.default()
@@ -432,6 +499,7 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 last_run_by_guild: dict[int, str] = {}
+timer_tasks: dict[tuple[int, int], asyncio.Task] = {}
 
 
 async def resolve_user_display_name(guild: discord.Guild, user_id: int) -> str:
@@ -466,11 +534,18 @@ async def collect_move_members(guild: discord.Guild, config: dict) -> tuple[disc
     study_channel_id = config.get("study_channel_id")
     if not game_channel_id or not study_channel_id:
         raise RuntimeError("移動元または移動先チャンネルが未設定です")
-    game_channel = guild.get_channel(game_channel_id) or await guild.fetch_channel(game_channel_id)
+    game_channel = await resolve_guild_channel(guild, int(game_channel_id))
+    if not isinstance(game_channel, discord.VoiceChannel):
+        raise RuntimeError(f"game_channel_id が不正です: {game_channel_id}")
     anythingok_voice_channel = None
     if anythingok_voice_channel_id:
-        anythingok_voice_channel = guild.get_channel(anythingok_voice_channel_id) or await guild.fetch_channel(anythingok_voice_channel_id)
-    study_channel = guild.get_channel(study_channel_id) or await guild.fetch_channel(study_channel_id)
+        resolved_anythingok = await resolve_guild_channel(guild, int(anythingok_voice_channel_id))
+        if resolved_anythingok is not None and not isinstance(resolved_anythingok, discord.VoiceChannel):
+            raise RuntimeError(f"anythingok_voice_channel_id が不正です: {anythingok_voice_channel_id}")
+        anythingok_voice_channel = resolved_anythingok
+    study_channel = await resolve_guild_channel(guild, int(study_channel_id))
+    if not isinstance(study_channel, discord.VoiceChannel):
+        raise RuntimeError(f"study_channel_id が不正です: {study_channel_id}")
     members: list[discord.Member] = []
     members.extend(list(game_channel.members))
     if anythingok_voice_channel is not None:
@@ -493,8 +568,10 @@ async def move_all_study_to_game(guild: discord.Guild, config: dict) -> int:
     study_channel_id = config.get("study_channel_id")
     if not game_channel_id or not study_channel_id:
         return 0
-    study_channel = guild.get_channel(study_channel_id) or await guild.fetch_channel(study_channel_id)
-    game_channel = guild.get_channel(game_channel_id) or await guild.fetch_channel(game_channel_id)
+    study_channel = await resolve_guild_channel(guild, int(study_channel_id))
+    game_channel = await resolve_guild_channel(guild, int(game_channel_id))
+    if not isinstance(study_channel, discord.VoiceChannel) or not isinstance(game_channel, discord.VoiceChannel):
+        raise RuntimeError("game_channel_id または study_channel_id が不正です")
     members = list(study_channel.members)
     for member in members:
         await member.move_to(game_channel)
@@ -505,7 +582,9 @@ async def send_message(guild: discord.Guild, config: dict) -> None:
     channel_id = config.get("general_channel_id")
     if not channel_id:
         return
-    channel = guild.get_channel(channel_id) or await guild.fetch_channel(channel_id)
+    channel = await resolve_guild_channel(guild, int(channel_id))
+    if not isinstance(channel, discord.abc.Messageable):
+        raise RuntimeError(f"general_channel_id が不正です: {channel_id}")
     message = config.get("notify_message", "20:30の通知です")
     notify_role_id = config.get("notify_role_id")
     if notify_role_id:
@@ -518,10 +597,24 @@ async def notify_error(guild: discord.Guild, config: dict, error_text: str) -> N
     if not error_channel_id:
         return
     try:
-        channel = guild.get_channel(error_channel_id) or await guild.fetch_channel(error_channel_id)
+        channel = await resolve_guild_channel(guild, int(error_channel_id))
+        if channel is None or not isinstance(channel, discord.abc.Messageable):
+            return
         await channel.send(f"⚠️ {error_text}")
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+    except Exception as error:
+        print(f"[notify_error] guild={guild.id} error={error}")
         return
+
+
+async def resolve_guild_channel(guild: discord.Guild, channel_id: int) -> discord.abc.GuildChannel | discord.Thread | None:
+    channel = guild.get_channel(channel_id)
+    if channel is not None:
+        return channel
+    try:
+        fetched = await guild.fetch_channel(channel_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException, discord.InvalidData):
+        return None
+    return fetched
 
 
 @tasks.loop(minutes=1)
@@ -546,6 +639,7 @@ async def notify_loop() -> None:
                 await send_weekly_summary(guild, config)
                 update_guild_config(guild.id, {"weekly_last_sent_week": week_key})
         except Exception as error:
+            print(f"[notify_loop] guild={guild.id} error={error}")
             await notify_error(guild, config, f"定時処理でエラーが発生しました: {error}")
 
 
@@ -576,16 +670,101 @@ async def on_ready() -> None:
     await tree.sync()
 
 
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+    if isinstance(error, app_commands.MissingPermissions):
+        user_message = "管理者権限が必要です。"
+    elif isinstance(error, app_commands.CheckFailure):
+        user_message = "このコマンドを実行する権限がありません。"
+    else:
+        user_message = "コマンドの実行中にエラーが発生しました。"
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(user_message, ephemeral=True)
+        else:
+            await interaction.response.send_message(user_message, ephemeral=True)
+    except discord.HTTPException:
+        pass
+    guild = interaction.guild
+    if guild is None:
+        return
+    config = get_guild_config(guild.id)
+    original_error = getattr(error, "original", error)
+    await notify_error(guild, config, f"コマンドエラー: {original_error}")
+
+
 config_group = app_commands.Group(name="config", description="ボット設定")
 tree.add_command(config_group)
 study_group = app_commands.Group(name="study", description="勉強時間")
 tree.add_command(study_group)
+config_maintenance_group = app_commands.Group(name="maintenance", description="メンテナンス設定")
+config_group.add_command(config_maintenance_group)
+config_aggregate_group = app_commands.Group(name="aggregate", description="集計設定")
+config_group.add_command(config_aggregate_group)
 
 
 def require_guild(interaction: discord.Interaction) -> int | None:
     if not interaction.guild_id:
         return None
     return interaction.guild_id
+
+
+@tree.command(name="send", description="ボイスチャンネル間でメンバーを移動します")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(from_channel="元のチャンネル", to_channel="送り先チャンネル", except_users="送らないユーザー(メンション/IDを空白かカンマ区切りで複数指定)")
+async def send_voice_members(
+    interaction: discord.Interaction,
+    from_channel: discord.VoiceChannel,
+    to_channel: discord.VoiceChannel,
+    except_users: str | None = None
+) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    if from_channel.id == to_channel.id:
+        await interaction.response.send_message("From と To は別のボイスチャンネルを指定してください。", ephemeral=True)
+        return
+    members = list(from_channel.members)
+    excluded_ids: set[int] = set()
+    if except_users:
+        tokens = [token for token in re.split(r"[\s,]+", except_users.strip()) if token]
+        invalid_tokens: list[str] = []
+        for token in tokens:
+            mention_match = re.fullmatch(r"<@!?(\d{15,20})>", token)
+            if mention_match:
+                excluded_ids.add(int(mention_match.group(1)))
+                continue
+            id_match = re.fullmatch(r"\d{15,20}", token)
+            if id_match:
+                excluded_ids.add(int(token))
+                continue
+            invalid_tokens.append(token)
+        if invalid_tokens:
+            await interaction.response.send_message(
+                "Except の形式が不正です。メンションまたはユーザーIDを空白かカンマ区切りで指定してください。",
+                ephemeral=True
+            )
+            return
+    if excluded_ids:
+        members = [member for member in members if member.id not in excluded_ids]
+    if not members:
+        await interaction.response.send_message("移動対象メンバーがいません。", ephemeral=True)
+        return
+    moved = 0
+    failed_count = 0
+    for member in members:
+        try:
+            await member.move_to(to_channel)
+            moved += 1
+        except (discord.Forbidden, discord.HTTPException):
+            failed_count += 1
+    result_message = f"{moved}人を {from_channel.mention} から {to_channel.mention} へ移動しました。"
+    if failed_count > 0:
+        result_message += f" 失敗: {failed_count}人"
+    if excluded_ids:
+        result_message += f" 除外指定: {len(excluded_ids)}人"
+    await interaction.response.send_message(result_message, ephemeral=True)
 
 
 @config_group.command(name="show")
@@ -786,7 +965,7 @@ async def config_clear_exclude_roles(interaction: discord.Interaction) -> None:
     await interaction.response.send_message("移動除外ロールをクリアしました。", ephemeral=True)
 
 
-@config_group.command(name="set_maintenance")
+@config_maintenance_group.command(name="set")
 @app_commands.checks.has_permissions(administrator=True)
 async def config_set_maintenance(interaction: discord.Interaction, enabled: bool) -> None:
     guild_id = require_guild(interaction)
@@ -797,7 +976,7 @@ async def config_set_maintenance(interaction: discord.Interaction, enabled: bool
     await interaction.response.send_message("メンテ停止スイッチを更新しました。", ephemeral=True)
 
 
-@config_group.command(name="set_maintenance_for")
+@config_maintenance_group.command(name="set_for")
 @app_commands.checks.has_permissions(administrator=True)
 async def config_set_maintenance_for(interaction: discord.Interaction, minutes: app_commands.Range[int, 1, 10080]) -> None:
     guild_id = require_guild(interaction)
@@ -817,7 +996,7 @@ async def config_set_maintenance_for(interaction: discord.Interaction, minutes: 
     )
 
 
-@config_group.command(name="add_exclude_user")
+@config_aggregate_group.command(name="add_exclude_user")
 @app_commands.checks.has_permissions(administrator=True)
 async def config_add_exclude_user(interaction: discord.Interaction, user: discord.Member) -> None:
     guild_id = require_guild(interaction)
@@ -832,7 +1011,7 @@ async def config_add_exclude_user(interaction: discord.Interaction, user: discor
     await interaction.response.send_message("集計除外ユーザーを追加しました。", ephemeral=True)
 
 
-@config_group.command(name="remove_exclude_user")
+@config_aggregate_group.command(name="remove_exclude_user")
 @app_commands.checks.has_permissions(administrator=True)
 async def config_remove_exclude_user(interaction: discord.Interaction, user: discord.Member) -> None:
     guild_id = require_guild(interaction)
@@ -845,7 +1024,7 @@ async def config_remove_exclude_user(interaction: discord.Interaction, user: dis
     await interaction.response.send_message("集計除外ユーザーを削除しました。", ephemeral=True)
 
 
-@config_group.command(name="clear_exclude_users")
+@config_aggregate_group.command(name="clear_exclude_users")
 @app_commands.checks.has_permissions(administrator=True)
 async def config_clear_exclude_users(interaction: discord.Interaction) -> None:
     guild_id = require_guild(interaction)
@@ -1054,10 +1233,108 @@ async def study_rank(interaction: discord.Interaction, limit: app_commands.Range
         await interaction.response.send_message("今日の記録はまだありません。", ephemeral=True)
         return
     lines: list[str] = []
+    names: list[str] = []
+    seconds_values: list[int] = []
     for index, (user_id, seconds) in enumerate(ranking, start=1):
         name = await resolve_user_display_name(guild, user_id)
         lines.append(f"{index}. {name} {format_seconds(seconds)}")
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        names.append(name)
+        seconds_values.append(seconds)
+    chart_stream = create_ranking_chart_image("Daily Ranking", names, seconds_values)
+    chart_file = discord.File(fp=chart_stream, filename="daily_rank.png")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True, file=chart_file)
+
+
+@study_group.command(name="weekly_rank")
+async def study_weekly_rank(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 30] = 10) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("サーバー情報を取得できませんでした。", ephemeral=True)
+        return
+    config = get_guild_config(guild_id)
+    timezone_name = config.get("timezone", "Asia/Tokyo")
+    reset_time = config.get("reset_time", "00:00")
+    period_days = int(config.get("weekly_period_days", 7))
+    now_utc = get_now_utc()
+    now_local = now_utc.astimezone(get_timezone(timezone_name))
+    excluded_user_ids = get_excluded_user_id_set(config)
+    totals = get_weekly_totals(guild_id, timezone_name, now_utc, reset_time, period_days, excluded_user_ids)
+    ranking = sorted(totals.items(), key=lambda item: item[1], reverse=True)[:limit]
+    if not ranking:
+        await interaction.response.send_message(f"直近{period_days}日の記録はまだありません。", ephemeral=True)
+        return
+    lines = ["週次勉強時間ランキング", get_period_range_text(now_local, reset_time, period_days)]
+    names: list[str] = []
+    seconds_values: list[int] = []
+    for index, (user_id, seconds) in enumerate(ranking, start=1):
+        name = await resolve_user_display_name(guild, user_id)
+        lines.append(f"{index}. {name} {format_seconds(seconds)}")
+        names.append(name)
+        seconds_values.append(seconds)
+    chart_stream = create_ranking_chart_image("Weekly Ranking", names, seconds_values)
+    chart_file = discord.File(fp=chart_stream, filename="weekly_rank.png")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True, file=chart_file)
+
+
+@study_group.command(name="timer")
+async def study_timer(interaction: discord.Interaction, minutes: app_commands.Range[int, 1, 720], title: str = "タイマー終了") -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    invoke_channel_id = interaction.channel_id
+    if not invoke_channel_id:
+        await interaction.response.send_message("通知先チャンネルを取得できませんでした。", ephemeral=True)
+        return
+    timer_key = (guild_id, interaction.user.id)
+    existing_task = timer_tasks.get(timer_key)
+    if existing_task is not None and not existing_task.done():
+        await interaction.response.send_message("すでにタイマーが動作中です。先に `/study timer_cancel` を実行してください。", ephemeral=True)
+        return
+    seconds = int(minutes) * 60
+
+    async def run_timer() -> None:
+        try:
+            await asyncio.sleep(seconds)
+            guild = interaction.guild
+            if guild is None:
+                return
+            target_channel = await resolve_guild_channel(guild, int(invoke_channel_id))
+            if target_channel is None or not isinstance(target_channel, discord.abc.Messageable):
+                return
+            try:
+                await target_channel.send(f"{interaction.user.mention} {title}（{int(minutes)}分）")
+            except (discord.Forbidden, discord.HTTPException) as error:
+                config = get_guild_config(guild.id)
+                await notify_error(guild, config, f"タイマー通知に失敗しました: {error}")
+        finally:
+            timer_tasks.pop(timer_key, None)
+
+    timer_tasks[timer_key] = asyncio.create_task(run_timer())
+    await interaction.response.send_message(
+        f"タイマーを開始しました。{int(minutes)}分後に <#{int(invoke_channel_id)}> へ通知します。"
+    )
+
+
+@study_group.command(name="timer_cancel")
+async def study_timer_cancel(interaction: discord.Interaction) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    timer_key = (guild_id, interaction.user.id)
+    task = timer_tasks.get(timer_key)
+    if task is None or task.done():
+        timer_tasks.pop(timer_key, None)
+        await interaction.response.send_message("停止できるタイマーはありません。", ephemeral=True)
+        return
+    task.cancel()
+    timer_tasks.pop(timer_key, None)
+    await interaction.response.send_message("タイマーを停止しました。", ephemeral=True)
 
 
 def main() -> None:

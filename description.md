@@ -26,11 +26,11 @@
 - [`/config add_exclude_role role:<role>`](#config-add-exclude-role)
 - [`/config remove_exclude_role role:<role>`](#config-remove-exclude-role)
 - [`/config clear_exclude_roles`](#config-clear-exclude-roles)
-- [`/config set_maintenance enabled:<true|false>`](#config-set-maintenance)
-- [`/config set_maintenance_for minutes:<1-10080>`](#config-set-maintenance-for)
-- [`/config add_exclude_user user:<member>`](#config-add-exclude-user)
-- [`/config remove_exclude_user user:<member>`](#config-remove-exclude-user)
-- [`/config clear_exclude_users`](#config-clear-exclude-users)
+- [`/config maintenance set enabled:<true|false>`](#config-maintenance-set)
+- [`/config maintenance set_for minutes:<1-10080>`](#config-maintenance-set-for)
+- [`/config aggregate add_exclude_user user:<member>`](#config-aggregate-add-exclude-user)
+- [`/config aggregate remove_exclude_user user:<member>`](#config-aggregate-remove-exclude-user)
+- [`/config aggregate clear_exclude_users`](#config-aggregate-clear-exclude-users)
 - [`/config set_error_channel channel:<text_channel>`](#config-set-error-channel)
 - [`/config clear_error_channel`](#config-clear-error-channel)
 - [`/config set_weekly_period days:<1-31>`](#config-set-weekly-period)
@@ -45,6 +45,9 @@
 
 - [`/study me`](#study-me)
 - [`/study rank limit:<1-30>`](#study-rank)
+- [`/study weekly_rank limit:<1-30>`](#study-weekly-rank)
+- [`/study timer minutes:<1-720> [title]`](#study-timer)
+- [`/study timer_cancel`](#study-timer-cancel)
 
 ## `/config` コマンド
 
@@ -145,35 +148,35 @@
 - 目的: 移動除外ロールを全解除。
 - 例: `/config clear_exclude_roles`
 
-<a id="config-set-maintenance"></a>
-### `/config set_maintenance enabled:<true|false>`
+<a id="config-maintenance-set"></a>
+### `/config maintenance set enabled:<true|false>`
 
 - 目的: 定時処理停止を手動で固定。
 - 仕様: `true` で停止、`false` で再開。実行時に `maintenance_until_epoch=0` にリセット。
 - 例: `/config set_maintenance enabled:true`
 
-<a id="config-set-maintenance-for"></a>
-### `/config set_maintenance_for minutes:<1-10080>`
+<a id="config-maintenance-set-for"></a>
+### `/config maintenance set_for minutes:<1-10080>`
 
 - 目的: 実行時刻から指定分だけメンテナンス有効化。
 - 仕様: 期限到達後、次の定時ループで自動解除。
 - 例: `/config set_maintenance_for minutes:60`
 
-<a id="config-add-exclude-user"></a>
-### `/config add_exclude_user user:<member>`
+<a id="config-aggregate-add-exclude-user"></a>
+### `/config aggregate add_exclude_user user:<member>`
 
 - 目的: 指定ユーザーをランキング集計から除外。
 - 影響範囲: `study rank` と週次ランキング通知。
 - 例: `/config add_exclude_user user:@Taro`
 
-<a id="config-remove-exclude-user"></a>
-### `/config remove_exclude_user user:<member>`
+<a id="config-aggregate-remove-exclude-user"></a>
+### `/config aggregate remove_exclude_user user:<member>`
 
 - 目的: 集計除外ユーザーを解除。
 - 例: `/config remove_exclude_user user:@Taro`
 
-<a id="config-clear-exclude-users"></a>
-### `/config clear_exclude_users`
+<a id="config-aggregate-clear-exclude-users"></a>
+### `/config aggregate clear_exclude_users`
 
 - 目的: 集計除外ユーザーを全解除。
 - 例: `/config clear_exclude_users`
@@ -255,10 +258,36 @@
 
 - 目的: 「今日」の勉強時間ランキングを表示。
 - 仕様: 進行中セッション分を加算。`aggregation_excluded_user_ids` は表示対象外。
+- 仕様: ランキング本文に加えて棒グラフ画像を添付。
 - 例: `/study rank`
 - 例: `/study rank limit:20`
+
+<a id="study-weekly-rank"></a>
+### `/study weekly_rank limit:<1-30>`
+
+- 目的: 週次ランキングの途中結果を手動表示。
+- 仕様: `weekly_period_days` 設定日数で集計。進行中セッションを加算。`aggregation_excluded_user_ids` は表示対象外。
+- 仕様: ランキング本文に加えて棒グラフ画像を添付。
+- 例: `/study weekly_rank`
+- 例: `/study weekly_rank limit:20`
+
+<a id="study-timer"></a>
+### `/study timer minutes:<1-720> [title]`
+
+- 目的: 指定分後にタイマー終了通知を送信。
+- 仕様: コマンドを実行したテキストチャンネルへ通知。ユーザーごとに1本のみ同時実行。
+- 例: `/study timer minutes:25 title:ポモドーロ終了`
+- 例: `/study timer minutes:5`
+
+<a id="study-timer-cancel"></a>
+### `/study timer_cancel`
+
+- 目的: 自分が起動したタイマーを停止。
+- 仕様: 動作中タイマーがない場合は停止対象なしを返す。
+- 例: `/study timer_cancel`
 
 ## 補足仕様
 
 - `set_maintenance enabled:false` 実行時は、期間指定メンテナンスも即解除されます。
 - 集計除外ユーザーはランキング集計だけ除外され、勉強時間の記録自体は継続されます。
+- タイマーはプロセス内メモリで管理されるため、ボット再起動時に失われます。
