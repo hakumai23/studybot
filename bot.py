@@ -500,6 +500,7 @@ tree = app_commands.CommandTree(client)
 
 last_run_by_guild: dict[int, str] = {}
 timer_tasks: dict[tuple[int, int], asyncio.Task] = {}
+timer_states: dict[tuple[int, int], dict[str, int | str]] = {}
 
 
 async def resolve_user_display_name(guild: discord.Guild, user_id: int) -> str:
@@ -1309,6 +1310,13 @@ async def study_timer(interaction: discord.Interaction, minutes: app_commands.Ra
         await interaction.response.send_message("すでにタイマーが動作中です。先に `/study timer_cancel` を実行してください。", ephemeral=True)
         return
     seconds = int(minutes) * 60
+    end_at_epoch = int((get_now_utc() + datetime.timedelta(seconds=seconds)).timestamp())
+    timer_states[timer_key] = {
+        "end_at_epoch": end_at_epoch,
+        "title": title,
+        "minutes": int(minutes),
+        "channel_id": int(invoke_channel_id)
+    }
 
     async def run_timer() -> None:
         try:
@@ -1316,16 +1324,22 @@ async def study_timer(interaction: discord.Interaction, minutes: app_commands.Ra
             guild = interaction.guild
             if guild is None:
                 return
-            target_channel = await resolve_guild_channel(guild, int(invoke_channel_id))
+            timer_state = timer_states.get(timer_key)
+            if timer_state is None:
+                return
+            target_channel = await resolve_guild_channel(guild, int(timer_state.get("channel_id", invoke_channel_id)))
             if target_channel is None or not isinstance(target_channel, discord.abc.Messageable):
                 return
             try:
-                await target_channel.send(f"{interaction.user.mention} {title}（{int(minutes)}分）")
+                notify_title = str(timer_state.get("title", "タイマー終了"))
+                notify_minutes = int(timer_state.get("minutes", int(minutes)))
+                await target_channel.send(f"{interaction.user.mention} {notify_title}（{notify_minutes}分）")
             except (discord.Forbidden, discord.HTTPException) as error:
                 config = get_guild_config(guild.id)
                 await notify_error(guild, config, f"タイマー通知に失敗しました: {error}")
         finally:
             timer_tasks.pop(timer_key, None)
+            timer_states.pop(timer_key, None)
 
     timer_tasks[timer_key] = asyncio.create_task(run_timer())
     await interaction.response.send_message(
@@ -1343,11 +1357,56 @@ async def study_timer_cancel(interaction: discord.Interaction) -> None:
     task = timer_tasks.get(timer_key)
     if task is None or task.done():
         timer_tasks.pop(timer_key, None)
+        timer_states.pop(timer_key, None)
         await interaction.response.send_message("停止できるタイマーはありません。", ephemeral=True)
         return
     task.cancel()
     timer_tasks.pop(timer_key, None)
+    timer_states.pop(timer_key, None)
     await interaction.response.send_message("タイマーを停止しました。", ephemeral=True)
+
+
+@study_group.command(name="timer_status")
+async def study_timer_status(interaction: discord.Interaction) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    timer_key = (guild_id, interaction.user.id)
+    task = timer_tasks.get(timer_key)
+    timer_state = timer_states.get(timer_key)
+    if task is None or task.done() or timer_state is None:
+        timer_tasks.pop(timer_key, None)
+        timer_states.pop(timer_key, None)
+        await interaction.response.send_message("動作中のタイマーはありません。", ephemeral=True)
+        return
+    now_epoch = int(get_now_utc().timestamp())
+    end_at_epoch = int(timer_state.get("end_at_epoch", now_epoch))
+    remaining_seconds = max(end_at_epoch - now_epoch, 0)
+    title = str(timer_state.get("title", "タイマー終了"))
+    channel_id = int(timer_state.get("channel_id", interaction.channel_id or 0))
+    await interaction.response.send_message(
+        f"タイマー残り時間: {format_seconds(remaining_seconds)}\nタイトル: {title}\n通知先: <#{channel_id}>",
+        ephemeral=True
+    )
+
+
+@study_group.command(name="timer_rename")
+async def study_timer_rename(interaction: discord.Interaction, title: str) -> None:
+    guild_id = require_guild(interaction)
+    if not guild_id:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+    timer_key = (guild_id, interaction.user.id)
+    task = timer_tasks.get(timer_key)
+    timer_state = timer_states.get(timer_key)
+    if task is None or task.done() or timer_state is None:
+        timer_tasks.pop(timer_key, None)
+        timer_states.pop(timer_key, None)
+        await interaction.response.send_message("変更できる動作中のタイマーはありません。", ephemeral=True)
+        return
+    timer_state["title"] = title
+    await interaction.response.send_message(f"タイマーのタイトルを変更しました: {title}", ephemeral=True)
 
 
 def main() -> None:
